@@ -133,7 +133,7 @@ Respond ONLY with strict JSON — no extra text:
                             "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
 
         resp = client.chat.completions.create(
-            model="meta-llama/llama-4-scout-17b-16e-instruct",
+            model="qwen/qwen3.6-27b",
             messages=[{"role": "user", "content": payload}],
             temperature=0.1,
             response_format={"type": "json_object"},
