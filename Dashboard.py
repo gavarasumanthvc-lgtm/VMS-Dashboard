@@ -54,8 +54,8 @@ if not hf_token:
     st.error("HF_TOKEN missing — add it in Streamlit Cloud → Settings → Secrets")
     st.stop()
 
-HF_API_URL = "https://router.huggingface.co/sambanova/v1/chat/completions"
-HF_MODEL   = "Meta-Llama-3.2-11B-Vision-Instruct"
+HF_API_URL = "https://router.huggingface.co/v1/chat/completions"
+HF_MODEL   = "meta-llama/Llama-3.2-11B-Vision-Instruct:sambanova"
 HEADERS = {"Authorization": f"Bearer {hf_token}", "Content-Type": "application/json"}
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
