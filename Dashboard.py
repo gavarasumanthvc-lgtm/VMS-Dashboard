@@ -4,6 +4,8 @@ import base64
 import json
 import tempfile
 import os
+import re
+import time
 import pandas as pd
 import requests
 from datetime import datetime
@@ -55,8 +57,15 @@ if not hf_token:
     st.stop()
 
 HF_API_URL = "https://router.huggingface.co/v1/chat/completions"
-HF_MODEL   = "meta-llama/Llama-3.2-11B-Vision-Instruct:sambanova"
-HEADERS = {"Authorization": f"Bearer {hf_token}", "Content-Type": "application/json"}
+# FIX 1: Clean model identifier (removed :sambanova)
+HF_MODEL = "meta-llama/Llama-3.2-11B-Vision-Instruct"
+
+# FIX 2: Pass SambaNova routing via provider header
+HEADERS = {
+    "Authorization": f"Bearer {hf_token}",
+    "Content-Type": "application/json",
+    "x-use-provider": "sambanova"
+}
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -84,7 +93,7 @@ def log(msg, level="INFO"):
     ts = datetime.now().strftime("%H:%M:%S")
     line = f"[{ts}] {level}: {msg}"
     log_lines.append(line)
-    print(line)  # also shows in Streamlit Cloud logs
+    print(line)
 
 def show_log_box(placeholder):
     if show_logs:
@@ -115,8 +124,9 @@ def extract_frames(video_path, n=6):
         cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
         ret, frame = cap.read()
         if ret:
-            frame = cv2.resize(frame, (640, 480))
-            _, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            # FIX 3: Increased image resolution to 1280x720 for readable text/barcodes
+            frame = cv2.resize(frame, (1280, 720))
+            _, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
             b64 = base64.b64encode(buf).decode('utf-8')
             frames_b64.append(b64)
             log(f"Frame {i+1}/{n} extracted at position {pos} ({len(b64)} bytes)")
@@ -129,7 +139,7 @@ def extract_frames(video_path, n=6):
 
 def query_vlm(image_b64, prompt, step_name):
     log(f"Calling HF API for: {step_name}")
-    log(f"Model: {HF_MODEL} via SambaNova")
+    log(f"Model: {HF_MODEL} via SambaNova Header Routing")
     log(f"Image size: {len(image_b64)} bytes")
 
     try:
@@ -151,7 +161,7 @@ def query_vlm(image_b64, prompt, step_name):
                 }
             ],
             "max_tokens": 256,
-            "temperature": 0.1
+            "temperature": 0.0  # FIX 4: Set temperature to 0.0 for consistent accuracy
         }
 
         log(f"Sending POST request to HuggingFace...")
@@ -160,17 +170,12 @@ def query_vlm(image_b64, prompt, step_name):
 
         if response.status_code == 503:
             log("Model loading (503) — waiting 20s and retrying...", "WARN")
-            import time
             time.sleep(20)
             response = requests.post(HF_API_URL, headers=HEADERS, json=payload, timeout=90)
             log(f"Retry response status: {response.status_code}")
 
         if response.status_code == 200:
             result = response.json()
-            log(f"Raw response type: {type(result).__name__}")
-            log(f"Raw response: {str(result)[:200]}")
-
-            # OpenAI-compatible chat completions format
             if isinstance(result, dict) and "choices" in result:
                 text = result["choices"][0]["message"]["content"]
                 log(f"Extracted text: {text[:100]}")
@@ -200,10 +205,10 @@ def query_vlm(image_b64, prompt, step_name):
         return f"Error: {str(e)}"
 
 def analyze_frame_for_step(image_b64, step_name, step_prompt):
-    full_prompt = f"""You are a warehouse inspection auditor checking SOP compliance.
+    full_prompt = f"""You are a strict warehouse inspection auditor checking SOP compliance.
 Look at this video frame and answer specifically about: {step_name}
 {step_prompt}
-Be specific about what you see. Keep answer to 2-3 sentences."""
+Be precise. State clearly if the item/label/tag is present, visible, and readable. Keep answer to 2-3 concise sentences."""
     return query_vlm(image_b64, full_prompt, step_name)
 
 def run_audit(video_bytes, stream_type, n_frames, log_placeholder):
@@ -216,17 +221,18 @@ def run_audit(video_bytes, stream_type, n_frames, log_placeholder):
 
     try:
         frames = extract_frames(tmp_path, n=n_frames)
-        os.remove(tmp_path)
+        if os.path.exists(tmp_path):
+            os.remove(tmp_path)
         show_log_box(log_placeholder)
 
         if not frames:
             log("No frames extracted — aborting", "ERROR")
             return {
                 "score": 0, "verdict": "REJECTED", "tracking_number": "None",
-                "label_check": "Could not read video file.",
-                "unboxing_check": "No footage.",
-                "brand_tag_check": "No tags.",
-                "product_check": "Product not visible."
+                "label_check": "Could not read video file.", "s1": 0,
+                "unboxing_check": "No footage.", "s2": 0,
+                "brand_tag_check": "No tags.", "s3": 0,
+                "product_check": "Product not visible.", "s4": 0
             }
 
         mid = len(frames) // 2
@@ -276,7 +282,6 @@ def run_audit(video_bytes, stream_type, n_frames, log_placeholder):
         show_log_box(log_placeholder)
 
         # Extract tracking number
-        import re
         tracking = "Not visible"
         numbers = re.findall(r'[A-Z0-9]{8,}', label_result.upper())
         if numbers:
@@ -285,18 +290,18 @@ def run_audit(video_bytes, stream_type, n_frames, log_placeholder):
         else:
             log("No tracking number found in label result")
 
-        # Scoring
+        # Scoring Logic
         def score_response(text, weight):
             text_lower = text.lower()
             negative = ["not visible", "cannot see", "no label", "not present",
-                       "unclear", "cannot read", "not shown", "error", "n/a"]
+                        "unclear", "cannot read", "not shown", "error", "n/a", "missing"]
             positive = ["visible", "can see", "shows", "displays", "readable",
-                       "present", "detected", "found", "held", "opened"]
+                        "present", "detected", "found", "held", "opened", "clear"]
             neg = sum(1 for w in negative if w in text_lower)
             pos = sum(1 for w in positive if w in text_lower)
-            if pos > neg:   return int(weight * 0.85)
-            elif pos == neg: return int(weight * 0.55)
-            else:            return int(weight * 0.20)
+            if pos > neg:     return int(weight * 1.0)
+            elif pos == neg:  return int(weight * 0.5)
+            else:            return int(weight * 0.0)
 
         s1 = score_response(label_result, 30)
         s2 = score_response(unboxing_result, 20)
@@ -304,14 +309,16 @@ def run_audit(video_bytes, stream_type, n_frames, log_placeholder):
         s4 = score_response(product_result, 25)
         total = s1 + s2 + s3 + s4
 
-        log(f"Scores — S1:{s1} S2:{s2} S3:{s3} S4:{s4} Total:{total}")
+        log(f"Scores — S1:{s1}/30 S2:{s2}/20 S3:{s3}/25 S4:{s4}/25 Total:{total}/100")
         verdict = "ACCEPTED" if total >= 85 else "REVIEW REQUIRED" if total >= 50 else "REJECTED"
         log(f"Verdict: {verdict}")
 
         return {
             "score": total, "verdict": verdict, "tracking_number": tracking,
-            "label_check": label_result, "unboxing_check": unboxing_result,
-            "brand_tag_check": tag_result, "product_check": product_result,
+            "label_check": label_result, "s1": s1,
+            "unboxing_check": unboxing_result, "s2": s2,
+            "brand_tag_check": tag_result, "s3": s3,
+            "product_check": product_result, "s4": s4,
         }
 
     except Exception as e:
@@ -320,13 +327,16 @@ def run_audit(video_bytes, stream_type, n_frames, log_placeholder):
             os.remove(tmp_path)
         return {
             "score": 0, "verdict": "ERROR", "tracking_number": "Error",
-            "label_check": f"Error: {e}",
-            "unboxing_check": "N/A", "brand_tag_check": "N/A", "product_check": "N/A"
+            "label_check": f"Error: {e}", "s1": 0,
+            "unboxing_check": "N/A", "s2": 0,
+            "brand_tag_check": "N/A", "s3": 0,
+            "product_check": "N/A", "s4": 0
         }
 
-def score_color(score):
-    if score >= 85: return "#22c55e"
-    if score >= 50: return "#f59e0b"
+def score_color(score, max_score=100):
+    pct = (score / max_score) * 100
+    if pct >= 80: return "#22c55e"
+    if pct >= 50: return "#f59e0b"
     return "#ef4444"
 
 def verdict_badge(score):
@@ -335,10 +345,10 @@ def verdict_badge(score):
     return '<span class="verdict-rejected">❌ REJECTED</span>'
 
 STEP_WEIGHTS = [
-    ("Shipping Label & Barcode",    "label_check",     30),
-    ("Packaging & Unboxing",        "unboxing_check",  20),
-    ("Brand Tag & Price Tag",       "brand_tag_check", 25),
-    ("Product Display & Condition", "product_check",   25),
+    ("Shipping Label & Barcode",    "label_check",     "s1", 30),
+    ("Packaging & Unboxing",        "unboxing_check",  "s2", 20),
+    ("Brand Tag & Price Tag",       "brand_tag_check", "s3", 25),
+    ("Product Display & Condition", "product_check",   "s4", 25),
 ]
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -376,7 +386,8 @@ for file in uploaded_files:
             show_log_box(log_placeholder)
             audit = run_audit(video_bytes, video_type, num_frames, log_placeholder)
 
-        os.remove(play_path)
+        if os.path.exists(play_path):
+            os.remove(play_path)
         show_log_box(log_placeholder)
 
         score    = audit.get("score", 0)
@@ -400,15 +411,20 @@ for file in uploaded_files:
             unsafe_allow_html=True,
         )
 
-        for label, key, weight in STEP_WEIGHTS:
-            text = audit.get(key, "N/A")
+        # FIX 5: Render progress bars based on individual step scores rather than the total score
+        for label, text_key, score_key, weight in STEP_WEIGHTS:
+            text = audit.get(text_key, "N/A")
+            step_score = audit.get(score_key, 0)
+            step_pct = int((step_score / weight) * 100) if weight > 0 else 0
+            step_clr = score_color(step_score, weight)
+
             st.markdown(f"""
             <div class="step-card">
                 <div class="step-title">{label}
-                    <span style="float:right;color:#475569;font-weight:400">{weight} pts</span>
+                    <span style="float:right;color:#94a3b8;font-weight:600">{step_score}/{weight} pts</span>
                 </div>
                 <div class="bar-bg">
-                    <div class="bar-fill" style="width:{score}%;background:{color}"></div>
+                    <div class="bar-fill" style="width:{step_pct}%;background:{step_clr}"></div>
                 </div>
                 <div class="step-body">{text}</div>
             </div>
