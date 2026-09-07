@@ -55,7 +55,7 @@ if not hf_token:
     st.stop()
 
 HF_API_URL = "https://router.huggingface.co/v1/chat/completions"
-HF_MODEL   = "meta-llama/Llama-3.2-11B-Vision-Instruct:together"
+HF_MODEL   = "google/gemma-4-31B-it:together"
 HEADERS = {"Authorization": f"Bearer {hf_token}", "Content-Type": "application/json"}
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
