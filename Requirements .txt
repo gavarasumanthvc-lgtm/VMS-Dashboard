@@ -1,4 +1,5 @@
 streamlit
 opencv-python-headless
-groq
+pyzbar          # optional but recommended for barcode scanning
 pandas
+numpy
