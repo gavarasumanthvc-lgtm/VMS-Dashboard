@@ -101,27 +101,30 @@ def extract_frames(video_path, n=6):
     cap = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     fps = cap.get(cv2.CAP_PROP_FPS)
-    log(f"Video info: {total} frames, {fps:.1f} FPS")
+    duration = total / fps if fps > 0 else 0
+    log(f"Video info: {total} frames, {fps:.1f} FPS, {duration:.1f}s")
 
     if total <= 0:
         log("ERROR: Could not read video frames", "ERROR")
         cap.release()
         return []
 
-    interval = max(1, total // n)
     frames_b64 = []
-    for i in range(n):
-        pos = min(i * interval, total - 1)
-        cap.set(cv2.CAP_PROP_POS_FRAMES, pos)
+    # Use time-based sampling instead of frame index for high FPS videos
+    sample_times = [duration * i / n for i in range(n)]
+
+    for i, t in enumerate(sample_times):
+        # Set position by milliseconds for accuracy
+        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
         ret, frame = cap.read()
         if ret:
             frame = cv2.resize(frame, (640, 480))
             _, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
             b64 = base64.b64encode(buf).decode('utf-8')
             frames_b64.append(b64)
-            log(f"Frame {i+1}/{n} extracted at position {pos} ({len(b64)} bytes)")
+            log(f"Frame {i+1}/{n} at {t:.1f}s ({len(b64)} bytes)")
         else:
-            log(f"Frame {i+1}/{n} failed to read", "WARN")
+            log(f"Frame {i+1}/{n} failed at {t:.1f}s", "WARN")
 
     cap.release()
     log(f"Total frames extracted: {len(frames_b64)}")
