@@ -6,6 +6,7 @@ import tempfile
 import os
 import pandas as pd
 import requests
+import numpy as np
 from datetime import datetime
 
 st.set_page_config(page_title="VMS Inspection Dashboard", layout="wide", page_icon="📦")
@@ -56,7 +57,7 @@ if not hf_token:
 
 HF_API_URL = "https://router.huggingface.co/v1/chat/completions"
 HF_MODEL   = "google/gemma-4-31B-it:together"
-HEADERS = {"Authorization": f"Bearer {hf_token}", "Content-Type": "application/json"}
+HEADERS    = {"Authorization": f"Bearer {hf_token}", "Content-Type": "application/json"}
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -68,8 +69,8 @@ with st.sidebar:
         accept_multiple_files=True,
     )
     st.divider()
-    num_frames = st.slider("Frames to sample per video", 4, 10, 6,
-                           help="More frames = more accurate but slower")
+    num_frames = st.slider("Frames per step", 2, 5, 3,
+                           help="More frames per SOP step = more accurate")
     show_logs = st.toggle("Show debug logs", value=True)
     st.divider()
     st.markdown("**💡 Slow upload?**")
@@ -84,257 +85,364 @@ def log(msg, level="INFO"):
     ts = datetime.now().strftime("%H:%M:%S")
     line = f"[{ts}] {level}: {msg}"
     log_lines.append(line)
-    print(line)  # also shows in Streamlit Cloud logs
+    print(line)
 
 def show_log_box(placeholder):
     if show_logs:
         placeholder.markdown(
-            "<div class='log-box'>" +
-            "<br>".join(log_lines[-30:]) +
-            "</div>",
+            "<div class='log-box'>" + "<br>".join(log_lines[-40:]) + "</div>",
             unsafe_allow_html=True
         )
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-def extract_frames(video_path, n=6):
+# ── Improvement 1: Motion-based key frame detection ───────────────────────────
+def detect_still_moments(video_path, duration, n_segments=4):
+    """
+    Find frames where operator holds something still (inspection moments).
+    Returns timestamps for each SOP segment.
+    """
+    cap = cv2.VideoCapture(video_path)
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    segment_duration = duration / n_segments
+    best_frames = {}
+
+    for seg in range(n_segments):
+        seg_start = seg * segment_duration
+        seg_end = (seg + 1) * segment_duration
+        # Sample frames in this segment
+        times = [seg_start + (seg_end - seg_start) * i / 5 for i in range(5)]
+        min_motion = float('inf')
+        best_time = times[len(times) // 2]
+        prev_gray = None
+
+        for t in times:
+            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+            if prev_gray is not None:
+                diff = cv2.absdiff(gray, prev_gray)
+                motion = float(np.mean(diff))
+                if motion < min_motion:
+                    min_motion = motion
+                    best_time = t
+            prev_gray = gray
+
+        best_frames[seg] = best_time
+        log(f"Segment {seg+1} best still moment at {best_time:.1f}s (motion={min_motion:.2f})")
+
+    cap.release()
+    return best_frames
+
+# ── Improvement 2: Smart frame extraction ─────────────────────────────────────
+def extract_smart_frames(video_path, n_per_step=3):
+    """
+    Extract high-res frames at key moments for each SOP step.
+    Returns dict: {step_name: [b64_frames]}
+    """
     log(f"Opening video: {video_path}")
     cap = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    duration = total / fps if fps > 0 else 0
-    log(f"Video info: {total} frames, {fps:.1f} FPS, {duration:.1f}s")
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30
+    duration = total / fps
+    log(f"Video: {total} frames, {fps:.1f} FPS, {duration:.1f}s")
 
     if total <= 0:
-        log("ERROR: Could not read video frames", "ERROR")
+        log("ERROR: Cannot read video", "ERROR")
         cap.release()
-        return []
+        return {}
 
-    frames_b64 = []
-    # Use time-based sampling instead of frame index for high FPS videos
-    sample_times = [duration * i / n for i in range(n)]
+    # SOP steps happen at different parts of the video
+    # Label is shown FIRST, unboxing NEXT, tags AFTER, product LAST
+    step_segments = {
+        "label":   (0.0,  0.25),   # first 25% — label shown before opening
+        "unboxing":(0.20, 0.55),   # 20-55% — opening package
+        "tags":    (0.45, 0.80),   # 45-80% — tags shown after opening
+        "product": (0.65, 1.00),   # last 35% — product displayed
+    }
 
-    for i, t in enumerate(sample_times):
-        # Set position by milliseconds for accuracy
-        cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
-        ret, frame = cap.read()
-        if ret:
-            frame = cv2.resize(frame, (640, 480))
-            _, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-            b64 = base64.b64encode(buf).decode('utf-8')
-            frames_b64.append(b64)
-            log(f"Frame {i+1}/{n} at {t:.1f}s ({len(b64)} bytes)")
-        else:
-            log(f"Frame {i+1}/{n} failed at {t:.1f}s", "WARN")
+    # Find still moments for each segment
+    still_moments = detect_still_moments(video_path, duration, n_segments=4)
+
+    step_frames = {}
+    for step, (start_pct, end_pct) in step_segments.items():
+        start_t = duration * start_pct
+        end_t   = duration * end_pct
+        times   = [start_t + (end_t - start_t) * i / (n_per_step - 1)
+                   for i in range(n_per_step)] if n_per_step > 1 else [start_t]
+
+        frames = []
+        for t in times:
+            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
+            ret, frame = cap.read()
+            if ret:
+                # Improvement 4: Higher resolution — 960x720
+                h, w = frame.shape[:2]
+                target_w = 960
+                target_h = int(h * target_w / w)
+                frame = cv2.resize(frame, (target_w, target_h))
+                _, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+                b64 = base64.b64encode(buf).decode('utf-8')
+                frames.append(b64)
+                log(f"  {step} frame at {t:.1f}s ({len(b64)//1024}KB)")
+            else:
+                log(f"  {step} frame failed at {t:.1f}s", "WARN")
+
+        step_frames[step] = frames
 
     cap.release()
-    log(f"Total frames extracted: {len(frames_b64)}")
-    return frames_b64
+    log(f"Extracted frames — " + ", ".join(f"{k}:{len(v)}" for k,v in step_frames.items()))
+    return step_frames
 
-def query_vlm(image_b64, prompt, step_name):
-    log(f"Calling HF API for: {step_name}")
-    log(f"Model: {HF_MODEL} via SambaNova")
-    log(f"Image size: {len(image_b64)} bytes")
+# ── Improvement 3: Targeted prompts per SOP step ──────────────────────────────
+STEP_PROMPTS = {
+    "label": """You are auditing a warehouse return inspection video for VMS Logistics SOP compliance.
+
+TASK: Analyze the shipping label and barcode visibility.
+
+Look carefully for:
+- Outer polybag or box with a shipping/AWB label
+- Ekart, Delhivery, Bluedart, or other carrier labels
+- Any barcode, QR code, or tracking number
+- Whether the label is held clearly toward the camera
+- Whether text is readable and not blurred
+
+READ AND REPORT:
+1. Exact tracking/AWB number if visible (e.g. MYER1069106708)
+2. Carrier name if visible
+3. Whether label is clear and unobstructed
+
+SCORING CRITERIA (30 points):
+- Label clearly visible and held toward camera: GOOD
+- Barcode/tracking number readable: GOOD  
+- Label blurred, obscured, or not shown: BAD
+- No label visible at all: FAIL
+
+Give your assessment in 3-4 specific sentences. Start with what you actually see.""",
+
+    "unboxing": """You are auditing a warehouse return inspection video for VMS Logistics SOP compliance.
+
+TASK: Analyze the packaging integrity and unboxing procedure.
+
+Look carefully for:
+- Is the outer polybag or box seal being inspected before opening?
+- Is the operator cutting or unsealing the package on camera?
+- Is the entire unboxing happening within the camera frame?
+- Any signs of pre-cutting, tampering, or damage to the seal?
+- Is the operator rotating the package to show all sides?
+
+SCORING CRITERIA (20 points):
+- Package opened fully on camera: GOOD
+- Seal inspected before opening: GOOD
+- Package rotated to show all sides: GOOD
+- Pre-cut or tampered seal: BAD
+- Unboxing happening off-camera: FAIL
+
+Give your assessment in 3-4 specific sentences. Start with what you actually see.""",
+
+    "tags": """You are auditing a warehouse return inspection video for VMS Logistics SOP compliance.
+
+TASK: Analyze brand tag and price tag verification.
+
+Look carefully for:
+- Brand fabric labels (neck label, waistband label)
+- Paper hangtags with price, size, or brand name
+- Plastic fasteners/tags still attached
+- Tags being held close to the camera lens
+- Whether tag text (brand, price, size) is readable
+
+SCORING CRITERIA (25 points):
+- Brand tag clearly shown close to camera: GOOD
+- Price/size tag visible and readable: GOOD
+- Tag text legible: GOOD
+- Tags not shown or too far from camera: BAD
+- Tags missing or removed: FAIL
+
+READ AND REPORT any brand name, price, or size you can see.
+Give your assessment in 3-4 specific sentences. Start with what you actually see.""",
+
+    "product": """You are auditing a warehouse return inspection video for VMS Logistics SOP compliance.
+
+TASK: Analyze product display and condition assessment.
+
+Look carefully for:
+- Is the item fully unfolded and displayed?
+- What type of item is it (shirt, pants, dress, etc)?
+- Is the front side shown clearly?
+- Is the back side also shown?
+- Any visible defects, stains, tears, or damage?
+- Signs of wear or incorrect item return?
+
+SCORING CRITERIA (25 points):
+- Item fully unfolded: GOOD
+- Both front and back shown: GOOD
+- Condition clearly visible: GOOD
+- Item only partially shown: BAD
+- Item kept folded or off-camera: FAIL
+
+Give your assessment in 3-4 specific sentences describing exactly what you see."""
+}
+
+# ── API call ──────────────────────────────────────────────────────────────────
+def query_vlm_multi(frames_b64, prompt, step_name):
+    """Send multiple frames for one step — model sees all frames together."""
+    log(f"Calling API for: {step_name} ({len(frames_b64)} frames)")
+    log(f"Model: {HF_MODEL}")
 
     try:
+        # Build content with all frames + prompt
+        content = []
+        for i, b64 in enumerate(frames_b64):
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
+            })
+        content.append({"type": "text", "text": prompt})
+
         payload = {
             "model": HF_MODEL,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": [
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}
-                        },
-                        {
-                            "type": "text",
-                            "text": prompt
-                        }
-                    ]
-                }
-            ],
-            "max_tokens": 256,
+            "messages": [{"role": "user", "content": content}],
+            "max_tokens": 400,
             "temperature": 0.1
         }
 
-        log(f"Sending POST request to HuggingFace...")
-        response = requests.post(HF_API_URL, headers=HEADERS, json=payload, timeout=90)
+        log(f"Sending request ({len(frames_b64)} images)...")
+        response = requests.post(HF_API_URL, headers=HEADERS, json=payload, timeout=120)
         log(f"Response status: {response.status_code}")
 
         if response.status_code == 503:
-            log("Model loading (503) — waiting 20s and retrying...", "WARN")
             import time
+            log("Model loading — waiting 20s...", "WARN")
             time.sleep(20)
-            response = requests.post(HF_API_URL, headers=HEADERS, json=payload, timeout=90)
-            log(f"Retry response status: {response.status_code}")
+            response = requests.post(HF_API_URL, headers=HEADERS, json=payload, timeout=120)
+            log(f"Retry status: {response.status_code}")
 
         if response.status_code == 200:
             result = response.json()
-            log(f"Raw response type: {type(result).__name__}")
-            log(f"Raw response: {str(result)[:200]}")
-
-            # OpenAI-compatible chat completions format
+            log(f"Raw response: {str(result)[:300]}")
             if isinstance(result, dict) and "choices" in result:
                 text = result["choices"][0]["message"]["content"]
-                log(f"Extracted text: {text[:100]}")
-                return text
-            if isinstance(result, list) and len(result) > 0:
-                text = result[0].get("generated_text", "")
-                if prompt in text:
-                    text = text.replace(prompt, "").strip()
-                log(f"Extracted text: {text[:100]}")
-                return text
-            if isinstance(result, dict):
-                text = result.get("generated_text", str(result))
-                log(f"Dict response text: {text[:100]}")
+                log(f"Answer: {text[:150]}")
                 return text
             return str(result)
-
         else:
-            error_text = response.text[:300]
-            log(f"API ERROR {response.status_code}: {error_text}", "ERROR")
-            return f"API error {response.status_code}: {error_text}"
+            error = response.text[:300]
+            log(f"API ERROR {response.status_code}: {error}", "ERROR")
+            return f"API error {response.status_code}: {error}"
 
     except requests.exceptions.Timeout:
-        log("Request timed out after 90 seconds", "ERROR")
+        log("Timeout after 120s", "ERROR")
         return "Error: Request timed out"
     except Exception as e:
         log(f"Exception: {str(e)}", "ERROR")
         return f"Error: {str(e)}"
 
-def analyze_frame_for_step(image_b64, step_name, step_prompt):
-    full_prompt = f"""You are a warehouse inspection auditor checking SOP compliance.
-Look at this video frame and answer specifically about: {step_name}
-{step_prompt}
-Be specific about what you see. Keep answer to 2-3 sentences."""
-    return query_vlm(image_b64, full_prompt, step_name)
+# ── Scoring ───────────────────────────────────────────────────────────────────
+def score_response(text, weight):
+    """Score based on positive/negative language in AI response."""
+    text_lower = text.lower()
+    
+    positive = ["visible", "can see", "shows", "displays", "readable", "present",
+                "detected", "found", "held", "opened", "unfolded", "clearly",
+                "label", "barcode", "tag", "brand", "tracking", "good", "compliant"]
+    negative = ["not visible", "cannot see", "no label", "not present", "unclear",
+                "cannot read", "not shown", "error", "missing", "absent", "fail",
+                "no tag", "not found", "obscured", "blurred", "off camera"]
 
-def run_audit(video_bytes, stream_type, n_frames, log_placeholder):
-    log(f"Starting audit — stream type: {stream_type}")
+    pos = sum(2 if phrase in text_lower else 0 for phrase in positive)
+    neg = sum(2 if phrase in text_lower else 0 for phrase in negative)
+
+    if "error" in text_lower and "api" in text_lower:
+        return int(weight * 0.20)
+    if pos > neg * 1.5:  return int(weight * 0.90)
+    if pos > neg:        return int(weight * 0.65)
+    if pos == neg:       return int(weight * 0.50)
+    return int(weight * 0.20)
+
+# ── Main audit ────────────────────────────────────────────────────────────────
+def run_audit(video_bytes, stream_type, n_per_step, log_placeholder):
+    log(f"Starting audit — {stream_type} — {len(video_bytes)/1024/1024:.1f}MB")
 
     with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp:
         tmp.write(video_bytes)
         tmp_path = tmp.name
-    log(f"Video saved to temp: {tmp_path} ({len(video_bytes)} bytes)")
+    log(f"Saved to: {tmp_path}")
+    show_log_box(log_placeholder)
 
     try:
-        frames = extract_frames(tmp_path, n=n_frames)
+        # Extract smart frames
+        step_frames = extract_smart_frames(tmp_path, n_per_step=n_per_step)
         os.remove(tmp_path)
         show_log_box(log_placeholder)
 
-        if not frames:
-            log("No frames extracted — aborting", "ERROR")
-            return {
-                "score": 0, "verdict": "REJECTED", "tracking_number": "None",
-                "label_check": "Could not read video file.",
-                "unboxing_check": "No footage.",
-                "brand_tag_check": "No tags.",
-                "product_check": "Product not visible."
-            }
+        if not step_frames:
+            return {"score": 0, "verdict": "REJECTED", "tracking_number": "None",
+                    "label_check": "Could not read video.",
+                    "unboxing_check": "N/A", "brand_tag_check": "N/A", "product_check": "N/A"}
 
-        mid = len(frames) // 2
-        frame_early = frames[0]
-        frame_mid   = frames[mid]
-        frame_late  = frames[-1]
-        frame_tag   = frames[min(mid + 1, len(frames) - 1)]
+        # Analyze each step with targeted prompt + multiple frames
+        results = {}
+        step_map = [
+            ("label",    "label_check"),
+            ("unboxing", "unboxing_check"),
+            ("tags",     "brand_tag_check"),
+            ("product",  "product_check"),
+        ]
 
-        log("--- Step 1: Shipping Label & Barcode ---")
-        label_result = analyze_frame_for_step(
-            frame_early,
-            "Shipping Label & Barcode Visibility",
-            "Is there a shipping label, AWB label, or barcode visible? "
-            "Can you read any tracking number, barcode digits, or carrier name? "
-            "Is the label clear and unobstructed?"
-        )
-        show_log_box(log_placeholder)
+        for step_key, result_key in step_map:
+            log(f"--- Analyzing: {step_key} ---")
+            frames = step_frames.get(step_key, [])
+            if frames:
+                text = query_vlm_multi(frames, STEP_PROMPTS[step_key], step_key)
+            else:
+                text = "No frames available for this step."
+            results[result_key] = text
+            show_log_box(log_placeholder)
 
-        log("--- Step 2: Packaging & Unboxing ---")
-        unboxing_result = analyze_frame_for_step(
-            frame_mid,
-            "Packaging Integrity & Unboxing",
-            "Is the operator opening a package or polybag on camera? "
-            "Does the package appear sealed or tampered? "
-            "Is the unboxing happening fully within the camera frame?"
-        )
-        show_log_box(log_placeholder)
-
-        log("--- Step 3: Brand Tag & Price Tag ---")
-        tag_result = analyze_frame_for_step(
-            frame_tag,
-            "Brand Tag & Price Tag Verification",
-            "Are there any brand labels, price tags, hangtags, or size tags visible? "
-            "What brand name, price, or size information can you read? "
-            "Are the tags held close to the camera?"
-        )
-        show_log_box(log_placeholder)
-
-        log("--- Step 4: Product Display & Condition ---")
-        product_result = analyze_frame_for_step(
-            frame_late,
-            "Product Display & Condition",
-            "Is a product/item fully unfolded and displayed? "
-            "What type of item is it and what is its condition? "
-            "Are both front and back sides being shown?"
-        )
-        show_log_box(log_placeholder)
-
-        # Extract tracking number
+        # Extract tracking number from label result
         import re
         tracking = "Not visible"
-        numbers = re.findall(r'[A-Z0-9]{8,}', label_result.upper())
-        if numbers:
-            tracking = numbers[0]
-            log(f"Tracking number found: {tracking}")
-        else:
-            log("No tracking number found in label result")
+        label_text = results.get("label_check", "")
+        # Look for alphanumeric strings 8+ chars (tracking numbers)
+        candidates = re.findall(r'\b[A-Z0-9]{8,}\b', label_text.upper())
+        # Filter out common false positives
+        false_positives = {"TRACKING", "SHIPPING", "BARCODE", "VISIBLE", "CAMERA",
+                          "LABEL", "CARRIER", "EKART", "CLEARLY", "SHOWING"}
+        real_numbers = [c for c in candidates if c not in false_positives]
+        if real_numbers:
+            tracking = real_numbers[0]
+            log(f"Tracking number: {tracking}")
 
-        # Scoring
-        def score_response(text, weight):
-            text_lower = text.lower()
-            negative = ["not visible", "cannot see", "no label", "not present",
-                       "unclear", "cannot read", "not shown", "error", "n/a"]
-            positive = ["visible", "can see", "shows", "displays", "readable",
-                       "present", "detected", "found", "held", "opened"]
-            neg = sum(1 for w in negative if w in text_lower)
-            pos = sum(1 for w in positive if w in text_lower)
-            if pos > neg:   return int(weight * 0.85)
-            elif pos == neg: return int(weight * 0.55)
-            else:            return int(weight * 0.20)
-
-        s1 = score_response(label_result, 30)
-        s2 = score_response(unboxing_result, 20)
-        s3 = score_response(tag_result, 25)
-        s4 = score_response(product_result, 25)
+        # Score each step
+        s1 = score_response(results["label_check"],     30)
+        s2 = score_response(results["unboxing_check"],  20)
+        s3 = score_response(results["brand_tag_check"], 25)
+        s4 = score_response(results["product_check"],   25)
         total = s1 + s2 + s3 + s4
 
-        log(f"Scores — S1:{s1} S2:{s2} S3:{s3} S4:{s4} Total:{total}")
+        log(f"Scores — Label:{s1}/30 Unboxing:{s2}/20 Tags:{s3}/25 Product:{s4}/25 = {total}/100")
         verdict = "ACCEPTED" if total >= 85 else "REVIEW REQUIRED" if total >= 50 else "REJECTED"
         log(f"Verdict: {verdict}")
 
         return {
             "score": total, "verdict": verdict, "tracking_number": tracking,
-            "label_check": label_result, "unboxing_check": unboxing_result,
-            "brand_tag_check": tag_result, "product_check": product_result,
+            **results
         }
 
     except Exception as e:
-        log(f"FATAL ERROR: {str(e)}", "ERROR")
+        log(f"FATAL: {str(e)}", "ERROR")
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
-        return {
-            "score": 0, "verdict": "ERROR", "tracking_number": "Error",
-            "label_check": f"Error: {e}",
-            "unboxing_check": "N/A", "brand_tag_check": "N/A", "product_check": "N/A"
-        }
+        return {"score": 0, "verdict": "ERROR", "tracking_number": "Error",
+                "label_check": f"Error: {e}",
+                "unboxing_check": "N/A", "brand_tag_check": "N/A", "product_check": "N/A"}
 
-def score_color(score):
-    if score >= 85: return "#22c55e"
-    if score >= 50: return "#f59e0b"
-    return "#ef4444"
+def score_color(s):
+    return "#22c55e" if s >= 85 else "#f59e0b" if s >= 50 else "#ef4444"
 
-def verdict_badge(score):
-    if score >= 85: return '<span class="verdict-accepted">✅ ACCEPTED</span>'
-    if score >= 50: return '<span class="verdict-review">⚠️ REVIEW REQUIRED</span>'
+def verdict_badge(s):
+    if s >= 85: return '<span class="verdict-accepted">✅ ACCEPTED</span>'
+    if s >= 50: return '<span class="verdict-review">⚠️ REVIEW REQUIRED</span>'
     return '<span class="verdict-rejected">❌ REJECTED</span>'
 
 STEP_WEIGHTS = [
@@ -344,13 +452,12 @@ STEP_WEIGHTS = [
     ("Product Display & Condition", "product_check",   25),
 ]
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── UI ────────────────────────────────────────────────────────────────────────
 if not uploaded_files:
     st.info("Upload one or more inspection videos from the sidebar to begin.")
     st.stop()
 
 st.subheader(f"Batch Inspection — {len(uploaded_files)} video(s) · Stream: {video_type}")
-
 csv_rows = []
 
 for file in uploaded_files:
@@ -369,13 +476,11 @@ for file in uploaded_files:
         st.video(play_path)
         if show_logs:
             st.markdown("**Debug Log**")
-            log_placeholder = st.empty()
-        else:
-            log_placeholder = st.empty()
+        log_placeholder = st.empty()
 
     with result_col:
         with st.spinner(f"Analyzing {file.name}..."):
-            log(f"Processing file: {file.name} ({len(video_bytes)/1024/1024:.1f} MB)")
+            log(f"Processing: {file.name} ({len(video_bytes)/1024/1024:.1f} MB)")
             show_log_box(log_placeholder)
             audit = run_audit(video_bytes, video_type, num_frames, log_placeholder)
 
@@ -436,8 +541,7 @@ if csv_rows:
     df = pd.DataFrame(csv_rows)
     st.dataframe(
         df[["File", "Verdict", "Score", "Tracking / AWB", "Stream Type", "Timestamp"]],
-        use_container_width=True,
-        hide_index=True,
+        use_container_width=True, hide_index=True,
     )
     st.download_button(
         "⬇️ Download Full Audit Report (CSV)",
