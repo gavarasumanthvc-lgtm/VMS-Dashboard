@@ -54,7 +54,7 @@ if not hf_token:
     st.error("HF_TOKEN missing — add it in Streamlit Cloud → Settings → Secrets")
     st.stop()
 
-HF_API_URL = "https://api-inference.huggingface.co/models/microsoft/Phi-3.5-vision-instruct"
+HF_API_URL = "https://router.huggingface.co/hf-inference/models/microsoft/Phi-3.5-vision-instruct/v1/chat/completions"
 HEADERS = {"Authorization": f"Bearer {hf_token}", "Content-Type": "application/json"}
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -133,14 +133,24 @@ def query_vlm(image_b64, prompt, step_name):
 
     try:
         payload = {
-            "inputs": {
-                "image": image_b64,
-                "question": prompt
-            },
-            "parameters": {
-                "max_new_tokens": 256,
-                "temperature": 0.1
-            }
+            "model": "microsoft/Phi-3.5-vision-instruct",
+            "messages": [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}
+                        },
+                        {
+                            "type": "text",
+                            "text": prompt
+                        }
+                    ]
+                }
+            ],
+            "max_tokens": 256,
+            "temperature": 0.1
         }
 
         log(f"Sending POST request to HuggingFace...")
@@ -159,6 +169,11 @@ def query_vlm(image_b64, prompt, step_name):
             log(f"Raw response type: {type(result).__name__}")
             log(f"Raw response: {str(result)[:200]}")
 
+            # OpenAI-compatible chat completions format
+            if isinstance(result, dict) and "choices" in result:
+                text = result["choices"][0]["message"]["content"]
+                log(f"Extracted text: {text[:100]}")
+                return text
             if isinstance(result, list) and len(result) > 0:
                 text = result[0].get("generated_text", "")
                 if prompt in text:
