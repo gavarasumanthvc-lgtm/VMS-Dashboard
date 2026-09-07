@@ -5,8 +5,8 @@ import json
 import tempfile
 import os
 import pandas as pd
+import requests
 from datetime import datetime
-from groq import Groq
 
 st.set_page_config(page_title="VMS Inspection Dashboard", layout="wide", page_icon="📦")
 
@@ -43,13 +43,16 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-api_key = st.secrets.get("GROQ_API_KEY")
-if not api_key:
-    st.error("GROQ_API_KEY missing — add it in Streamlit Cloud → Settings → Secrets")
+# ── Auth ──────────────────────────────────────────────────────────────────────
+hf_token = st.secrets.get("HF_TOKEN")
+if not hf_token:
+    st.error("HF_TOKEN missing — add it in Streamlit Cloud → Settings → Secrets")
     st.stop()
 
-client = Groq(api_key=api_key)
+HF_API_URL = "https://api-inference.huggingface.co/models/llava-hf/llava-1.5-7b-hf"
+HEADERS = {"Authorization": f"Bearer {hf_token}"}
 
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Configuration")
     video_type = st.selectbox("Process Stream Type", ["Return", "Forward"])
@@ -59,16 +62,17 @@ with st.sidebar:
         accept_multiple_files=True,
     )
     st.divider()
-    num_frames = st.slider("Frames to sample per video", 5, 15, 10,
+    num_frames = st.slider("Frames to sample per video", 4, 10, 6,
                            help="More frames = more accurate but slower")
     st.divider()
     st.markdown("**💡 Slow upload?**")
-    st.caption("Compress videos before uploading to speed things up:")
-    st.caption("• **Android/iPhone:** Use app **Video Compress**")
-    st.caption("• **PC:** Use **HandBrake** (free) — set quality to RF 28")
-    st.caption("• **Quick tip:** Record at 720p not 1080p — 5x smaller file")
+    st.caption("Compress videos before uploading:")
+    st.caption("• Phone: use **Video Compress** app")
+    st.caption("• PC: use **HandBrake** — set RF 28")
+    st.caption("• Record at **720p** not 1080p")
 
-def extract_frames(video_path, n=10):
+# ── Helpers ───────────────────────────────────────────────────────────────────
+def extract_frames(video_path, n=6):
     cap = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     if total <= 0:
@@ -80,11 +84,46 @@ def extract_frames(video_path, n=10):
         cap.set(cv2.CAP_PROP_POS_FRAMES, min(i * interval, total - 1))
         ret, frame = cap.read()
         if ret:
-            frame = cv2.resize(frame, (960, 720))
-            _, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+            frame = cv2.resize(frame, (640, 480))
+            _, buf = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
             frames_b64.append(base64.b64encode(buf).decode('utf-8'))
     cap.release()
     return frames_b64
+
+def query_vlm(image_b64, prompt):
+    """Send a single frame to HuggingFace LLaVA VLM."""
+    try:
+        payload = {
+            "inputs": {
+                "image": image_b64,
+                "text": prompt
+            }
+        }
+        response = requests.post(HF_API_URL, headers=HEADERS, json=payload, timeout=60)
+        if response.status_code == 503:
+            # Model loading — wait and retry
+            import time
+            time.sleep(20)
+            response = requests.post(HF_API_URL, headers=HEADERS, json=payload, timeout=60)
+        if response.status_code == 200:
+            result = response.json()
+            if isinstance(result, list):
+                return result[0].get("generated_text", "")
+            return str(result)
+        return f"API error {response.status_code}: {response.text[:200]}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+def analyze_frame_for_step(image_b64, step_name, step_prompt):
+    """Analyze a single frame for a specific SOP step."""
+    full_prompt = f"""You are a warehouse inspection auditor checking SOP compliance.
+Look at this video frame and answer specifically about: {step_name}
+
+{step_prompt}
+
+Be specific about what you see. If something is visible, describe it exactly.
+Keep your answer to 2-3 sentences."""
+    return query_vlm(image_b64, full_prompt)
 
 def run_audit(video_bytes, stream_type, n_frames):
     with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp:
@@ -96,56 +135,105 @@ def run_audit(video_bytes, stream_type, n_frames):
         os.remove(tmp_path)
 
         if not frames:
-            return {"score": 0, "verdict": "REJECTED", "tracking_number": "None",
-                    "label_check": "Corrupted or unreadable video.",
-                    "unboxing_check": "No footage recorded.",
-                    "brand_tag_check": "No tags detected.",
-                    "product_check": "Product not visible."}
+            return {
+                "score": 0, "verdict": "REJECTED", "tracking_number": "None",
+                "label_check": "Could not read video file.",
+                "unboxing_check": "No footage.", "brand_tag_check": "No tags.",
+                "product_check": "Product not visible."
+            }
 
-        prompt = f"""
-You are a VMS Return & Packing Audit Engine inspecting a logistics stream ({stream_type}).
-Analyze these {n_frames} sequential video frames and generate a precise compliance report.
+        # Use best frames for each step
+        mid = len(frames) // 2
+        frame_early  = frames[0]
+        frame_mid    = frames[mid]
+        frame_late   = frames[-1]
 
-Evaluate against 4 mandatory SOP criteria:
-1. Shipping Label & Barcode Visibility (30 pts): Is the outer shipping label or AWB clearly held toward the camera?
-   IMPORTANT: Read and extract the exact barcode number, AWB number, or tracking number visible on any label.
-   If you can read any alphanumeric string from a barcode or label, include it exactly as seen.
-2. Packaging Integrity & Unboxing (20 pts): Is the outer seal inspected for tampering and opened fully on camera?
-3. Brand Tag & Price Tag Verification (25 pts): Are brand labels, hangtags, price tags shown close to lens?
-   State exact brand name, size, price, or tag condition visible.
-4. Product Inspection & Condition (25 pts): Is the item fully unfolded and displayed on both sides?
-   Describe fabric condition, defects, colour, buttons, or sleeves visible.
-
-Respond ONLY with strict JSON — no extra text:
-{{
-    "score": <integer 0-100>,
-    "verdict": "<ACCEPTED | REVIEW REQUIRED | REJECTED>",
-    "tracking_number": "<exact barcode/AWB/tracking string read from label, or 'Not visible' if unreadable>",
-    "label_check": "<specific observations about label and barcode visibility>",
-    "unboxing_check": "<specific observations about package seal and unboxing>",
-    "brand_tag_check": "<specific observations about brand tags, price tags, size tags>",
-    "product_check": "<specific observations about product display and condition>"
-}}
-"""
-        payload = [{"type": "text", "text": prompt}]
-        for b64 in frames:
-            payload.append({"type": "image_url",
-                            "image_url": {"url": f"data:image/jpeg;base64,{b64}"}})
-
-        resp = client.chat.completions.create(
-            model="qwen/qwen3.6-27b",
-            messages=[{"role": "user", "content": payload}],
-            temperature=0.1,
-            response_format={"type": "json_object"},
+        # Step 1 — Shipping label (use early frame, label shown first)
+        label_result = analyze_frame_for_step(
+            frame_early,
+            "Shipping Label & Barcode Visibility",
+            "Is there a shipping label, AWB label, or barcode visible? "
+            "Can you read any tracking number, barcode digits, or carrier name? "
+            "Is the label clear and unobstructed?"
         )
-        return json.loads(resp.choices[0].message.content)
+
+        # Step 2 — Unboxing (use mid frame)
+        unboxing_result = analyze_frame_for_step(
+            frame_mid,
+            "Packaging Integrity & Unboxing",
+            "Is the operator opening a package or polybag on camera? "
+            "Does the package appear sealed or tampered? "
+            "Is the unboxing happening fully within the camera frame?"
+        )
+
+        # Step 3 — Brand tags (use mid-late frame)
+        tag_frame = frames[min(mid + 1, len(frames) - 1)]
+        tag_result = analyze_frame_for_step(
+            tag_frame,
+            "Brand Tag & Price Tag Verification",
+            "Are there any brand labels, price tags, hangtags, or size tags visible? "
+            "What brand name, price, or size information can you read? "
+            "Are the tags held close to the camera?"
+        )
+
+        # Step 4 — Product display (use late frame)
+        product_result = analyze_frame_for_step(
+            frame_late,
+            "Product Display & Condition",
+            "Is a product/item fully unfolded and displayed? "
+            "What type of item is it and what is its condition? "
+            "Are both front and back sides being shown?"
+        )
+
+        # Extract tracking number from label result
+        tracking = "Not visible"
+        import re
+        numbers = re.findall(r'[A-Z0-9]{8,}', label_result.upper())
+        if numbers:
+            tracking = numbers[0]
+
+        # Score based on response quality
+        def score_response(text, weight):
+            text_lower = text.lower()
+            negative = ["not visible", "cannot see", "no label", "not present",
+                       "unclear", "cannot read", "not shown", "error", "n/a"]
+            positive = ["visible", "can see", "shows", "displays", "readable",
+                       "present", "detected", "found", "held", "opened"]
+            neg_count = sum(1 for w in negative if w in text_lower)
+            pos_count = sum(1 for w in positive if w in text_lower)
+            if pos_count > neg_count:
+                return int(weight * 0.85)
+            elif pos_count == neg_count:
+                return int(weight * 0.55)
+            else:
+                return int(weight * 0.20)
+
+        s1 = score_response(label_result, 30)
+        s2 = score_response(unboxing_result, 20)
+        s3 = score_response(tag_result, 25)
+        s4 = score_response(product_result, 25)
+        total = s1 + s2 + s3 + s4
+
+        verdict = "ACCEPTED" if total >= 85 else "REVIEW REQUIRED" if total >= 50 else "REJECTED"
+
+        return {
+            "score": total,
+            "verdict": verdict,
+            "tracking_number": tracking,
+            "label_check": label_result,
+            "unboxing_check": unboxing_result,
+            "brand_tag_check": tag_result,
+            "product_check": product_result,
+        }
 
     except Exception as e:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
-        return {"score": 0, "verdict": "ERROR", "tracking_number": "Error",
-                "label_check": f"Error: {e}",
-                "unboxing_check": "N/A", "brand_tag_check": "N/A", "product_check": "N/A"}
+        return {
+            "score": 0, "verdict": "ERROR", "tracking_number": "Error",
+            "label_check": f"Error: {e}",
+            "unboxing_check": "N/A", "brand_tag_check": "N/A", "product_check": "N/A"
+        }
 
 def score_color(score):
     if score >= 85: return "#22c55e"
@@ -164,6 +252,7 @@ STEP_WEIGHTS = [
     ("Product Display & Condition", "product_check",   25),
 ]
 
+# ── Main ──────────────────────────────────────────────────────────────────────
 if not uploaded_files:
     st.info("Upload one or more inspection videos from the sidebar to begin.")
     st.stop()
@@ -187,7 +276,7 @@ for file in uploaded_files:
         st.video(play_path)
 
     with result_col:
-        with st.spinner(f"Analyzing {file.name} with Groq Vision AI..."):
+        with st.spinner(f"Analyzing {file.name} with VLM..."):
             audit = run_audit(video_bytes, video_type, num_frames)
 
         os.remove(play_path)
@@ -207,8 +296,6 @@ for file in uploaded_files:
             f'<div class="bar-bg"><div class="bar-fill" style="width:{score}%;background:{color}"></div></div>',
             unsafe_allow_html=True,
         )
-
-        # Tracking number read by AI
         st.markdown(
             f'<div style="margin-bottom:10px">🔍 <b style="color:#94a3b8">Tracking / AWB:</b> '
             f'<span class="barcode-pill">{tracking}</span></div>',
@@ -219,8 +306,12 @@ for file in uploaded_files:
             text = audit.get(key, "N/A")
             st.markdown(f"""
             <div class="step-card">
-                <div class="step-title">{label} <span style="float:right;color:#475569;font-weight:400">{weight} pts</span></div>
-                <div class="bar-bg"><div class="bar-fill" style="width:{score}%;background:{color}"></div></div>
+                <div class="step-title">{label}
+                    <span style="float:right;color:#475569;font-weight:400">{weight} pts</span>
+                </div>
+                <div class="bar-bg">
+                    <div class="bar-fill" style="width:{score}%;background:{color}"></div>
+                </div>
                 <div class="step-body">{text}</div>
             </div>
             """, unsafe_allow_html=True)
