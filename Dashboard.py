@@ -10,7 +10,6 @@ from groq import Groq
 
 st.set_page_config(page_title="VMS Inspection Dashboard", layout="wide", page_icon="📦")
 
-# ── Styles ────────────────────────────────────────────────────────────────────
 st.markdown("""
 <style>
 .stApp { background-color: #0e1117; color: #f0f0f0; }
@@ -30,10 +29,14 @@ st.markdown("""
 .step-body  { font-size:13px; color:#94a3b8; line-height:1.6; }
 .bar-bg   { background:#2a2d3a; border-radius:4px; height:7px; overflow:hidden; margin:6px 0 10px; }
 .bar-fill { height:7px; border-radius:4px; }
+.barcode-pill {
+    display:inline-block; background:#1e2d40; border:1px solid #2a4a6b;
+    border-radius:6px; padding:4px 12px; font-size:13px;
+    color:#60a5fa; font-family:monospace; margin-top:6px;
+}
 </style>
 """, unsafe_allow_html=True)
 
-# ── Header ────────────────────────────────────────────────────────────────────
 st.markdown("""
 <div class="header-box">
     <h3 style="margin:0;color:#fff;font-weight:600;">📦 VMS Inspection Dashboard</h3>
@@ -43,15 +46,13 @@ st.markdown("""
 </div>
 """, unsafe_allow_html=True)
 
-# ── Auth ──────────────────────────────────────────────────────────────────────
 api_key = st.secrets.get("GROQ_API_KEY")
 if not api_key:
-    st.error("GROQ_API_KEY missing in .streamlit/secrets.toml")
+    st.error("GROQ_API_KEY missing — add it in Streamlit Cloud → Settings → Secrets")
     st.stop()
 
 client = Groq(api_key=api_key)
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.header("Configuration")
     video_type = st.selectbox("Process Stream Type", ["Return", "Forward"])
@@ -65,7 +66,6 @@ with st.sidebar:
                            help="More frames = more accurate but slower")
     st.caption("Powered by Groq · LLaMA 3.2 Vision")
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
 def extract_frames(video_path, n=10):
     cap = cv2.VideoCapture(video_path)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -94,7 +94,7 @@ def run_audit(video_bytes, stream_type, n_frames):
         os.remove(tmp_path)
 
         if not frames:
-            return {"score": 0, "verdict": "REJECTED",
+            return {"score": 0, "verdict": "REJECTED", "tracking_number": "None",
                     "label_check": "Corrupted or unreadable video.",
                     "unboxing_check": "No footage recorded.",
                     "brand_tag_check": "No tags detected.",
@@ -105,19 +105,24 @@ You are a VMS Return & Packing Audit Engine inspecting a logistics stream ({stre
 Analyze these {n_frames} sequential video frames and generate a precise compliance report.
 
 Evaluate against 4 mandatory SOP criteria:
-1. Shipping Label & Barcode Visibility (30 pts): Is the outer shipping label, AWB, or barcode clearly held toward the camera? Read any visible tracking numbers or barcode strings.
+1. Shipping Label & Barcode Visibility (30 pts): Is the outer shipping label or AWB clearly held toward the camera?
+   IMPORTANT: Read and extract the exact barcode number, AWB number, or tracking number visible on any label.
+   If you can read any alphanumeric string from a barcode or label, include it exactly as seen.
 2. Packaging Integrity & Unboxing (20 pts): Is the outer seal inspected for tampering and opened fully on camera?
-3. Brand Tag & Price Tag Verification (25 pts): Are brand labels, hangtags, price tags, or size tags shown close to the lens? State exact brand name, size, or tag condition.
-4. Product Inspection & Condition (25 pts): Is the item fully unfolded and displayed on both sides? Describe fabric condition, any defects, buttons, or sleeves visible.
+3. Brand Tag & Price Tag Verification (25 pts): Are brand labels, hangtags, price tags shown close to lens?
+   State exact brand name, size, price, or tag condition visible.
+4. Product Inspection & Condition (25 pts): Is the item fully unfolded and displayed on both sides?
+   Describe fabric condition, defects, colour, buttons, or sleeves visible.
 
-Respond ONLY with strict JSON:
+Respond ONLY with strict JSON — no extra text:
 {{
     "score": <integer 0-100>,
     "verdict": "<ACCEPTED | REVIEW REQUIRED | REJECTED>",
-    "label_check": "<specific observations>",
-    "unboxing_check": "<specific observations>",
-    "brand_tag_check": "<specific observations>",
-    "product_check": "<specific observations>"
+    "tracking_number": "<exact barcode/AWB/tracking string read from label, or 'Not visible' if unreadable>",
+    "label_check": "<specific observations about label and barcode visibility>",
+    "unboxing_check": "<specific observations about package seal and unboxing>",
+    "brand_tag_check": "<specific observations about brand tags, price tags, size tags>",
+    "product_check": "<specific observations about product display and condition>"
 }}
 """
         payload = [{"type": "text", "text": prompt}]
@@ -136,7 +141,7 @@ Respond ONLY with strict JSON:
     except Exception as e:
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
-        return {"score": 0, "verdict": "ERROR",
+        return {"score": 0, "verdict": "ERROR", "tracking_number": "Error",
                 "label_check": f"Error: {e}",
                 "unboxing_check": "N/A", "brand_tag_check": "N/A", "product_check": "N/A"}
 
@@ -157,7 +162,6 @@ STEP_WEIGHTS = [
     ("Product Display & Condition", "product_check",   25),
 ]
 
-# ── Main ──────────────────────────────────────────────────────────────────────
 if not uploaded_files:
     st.info("Upload one or more inspection videos from the sidebar to begin.")
     st.stop()
@@ -171,7 +175,6 @@ for file in uploaded_files:
 
     vid_col, result_col = st.columns([1, 1], gap="large")
 
-    # Write temp for video player
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
         video_bytes = file.read()
         tmp.write(video_bytes)
@@ -187,11 +190,11 @@ for file in uploaded_files:
 
         os.remove(play_path)
 
-        score   = audit.get("score", 0)
-        verdict = audit.get("verdict", "REJECTED")
-        color   = score_color(score)
+        score    = audit.get("score", 0)
+        verdict  = audit.get("verdict", "REJECTED")
+        tracking = audit.get("tracking_number", "Not visible")
+        color    = score_color(score)
 
-        # Score + verdict
         st.markdown(
             f'{verdict_badge(score)}&nbsp;&nbsp;'
             f'<span class="big-score" style="color:{color}">{score}</span>'
@@ -203,12 +206,15 @@ for file in uploaded_files:
             unsafe_allow_html=True,
         )
 
-        # 4 step cards
-        step_score = score // 4  # approximate per-step for bar width
+        # Tracking number read by AI
+        st.markdown(
+            f'<div style="margin-bottom:10px">🔍 <b style="color:#94a3b8">Tracking / AWB:</b> '
+            f'<span class="barcode-pill">{tracking}</span></div>',
+            unsafe_allow_html=True,
+        )
+
         for label, key, weight in STEP_WEIGHTS:
             text = audit.get(key, "N/A")
-            # Estimate per-step contribution proportionally
-            approx_pct = min(100, int(score * weight / 100 / weight * 100))
             st.markdown(f"""
             <div class="step-card">
                 <div class="step-title">{label} <span style="float:right;color:#475569;font-weight:400">{weight} pts</span></div>
@@ -218,30 +224,27 @@ for file in uploaded_files:
             """, unsafe_allow_html=True)
 
         csv_rows.append({
-            "Timestamp":        datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "File":             file.name,
-            "Stream Type":      video_type,
-            "Verdict":          verdict,
-            "Score":            score,
-            "Label & Barcode":  audit.get("label_check", ""),
-            "Packaging":        audit.get("unboxing_check", ""),
-            "Brand Tags":       audit.get("brand_tag_check", ""),
-            "Product Condition":audit.get("product_check", ""),
+            "Timestamp":         datetime.now().strftime("%Y-%m-%d %H:%M"),
+            "File":              file.name,
+            "Stream Type":       video_type,
+            "Verdict":           verdict,
+            "Score":             score,
+            "Tracking / AWB":    tracking,
+            "Label & Barcode":   audit.get("label_check", ""),
+            "Packaging":         audit.get("unboxing_check", ""),
+            "Brand Tags":        audit.get("brand_tag_check", ""),
+            "Product Condition": audit.get("product_check", ""),
         })
 
-# ── CSV Download ──────────────────────────────────────────────────────────────
 if csv_rows:
     st.divider()
     st.subheader("Batch Summary")
     df = pd.DataFrame(csv_rows)
-
-    # Display table (key columns only)
     st.dataframe(
-        df[["File", "Verdict", "Score", "Stream Type", "Timestamp"]],
+        df[["File", "Verdict", "Score", "Tracking / AWB", "Stream Type", "Timestamp"]],
         use_container_width=True,
         hide_index=True,
     )
-
     st.download_button(
         "⬇️ Download Full Audit Report (CSV)",
         data=df.to_csv(index=False),
