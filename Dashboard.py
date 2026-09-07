@@ -40,9 +40,6 @@ st.markdown("""
 st.markdown("""
 <div class="header-box">
     <h3 style="margin:0;color:#fff;font-weight:600;">📦 VMS Inspection Dashboard</h3>
-    <p style="margin:4px 0 0;color:#94a3b8;font-size:13px;">
-        AI-powered Return & Packing SOP Verification — Groq Vision
-    </p>
 </div>
 """, unsafe_allow_html=True)
 
@@ -64,7 +61,12 @@ with st.sidebar:
     st.divider()
     num_frames = st.slider("Frames to sample per video", 5, 15, 10,
                            help="More frames = more accurate but slower")
-    st.caption("Powered by Groq · LLaMA 3.2 Vision")
+    st.divider()
+    st.markdown("**💡 Slow upload?**")
+    st.caption("Compress videos before uploading to speed things up:")
+    st.caption("• **Android/iPhone:** Use app **Video Compress**")
+    st.caption("• **PC:** Use **HandBrake** (free) — set quality to RF 28")
+    st.caption("• **Quick tip:** Record at 720p not 1080p — 5x smaller file")
 
 def extract_frames(video_path, n=10):
     cap = cv2.VideoCapture(video_path)
