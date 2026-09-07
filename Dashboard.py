@@ -54,7 +54,8 @@ if not hf_token:
     st.error("HF_TOKEN missing — add it in Streamlit Cloud → Settings → Secrets")
     st.stop()
 
-HF_API_URL = "https://router.huggingface.co/hf-inference/models/microsoft/Phi-3.5-vision-instruct/v1/chat/completions"
+HF_API_URL = "https://router.huggingface.co/sambanova/v1/chat/completions"
+HF_MODEL   = "Meta-Llama-3.2-11B-Vision-Instruct"
 HEADERS = {"Authorization": f"Bearer {hf_token}", "Content-Type": "application/json"}
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -128,12 +129,12 @@ def extract_frames(video_path, n=6):
 
 def query_vlm(image_b64, prompt, step_name):
     log(f"Calling HF API for: {step_name}")
-    log(f"Model: Phi-3.5-vision-instruct")
+    log(f"Model: {HF_MODEL} via SambaNova")
     log(f"Image size: {len(image_b64)} bytes")
 
     try:
         payload = {
-            "model": "microsoft/Phi-3.5-vision-instruct",
+            "model": HF_MODEL,
             "messages": [
                 {
                     "role": "user",
