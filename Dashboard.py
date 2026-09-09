@@ -7,6 +7,7 @@ import os
 import pandas as pd
 import requests
 import numpy as np
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 
 st.set_page_config(page_title="VMS Inspection Dashboard", layout="wide", page_icon="📦")
@@ -69,7 +70,7 @@ with st.sidebar:
         accept_multiple_files=True,
     )
     st.divider()
-    num_frames = st.slider("Frames per step", 2, 5, 3,
+    num_frames = st.slider("Frames per step", 2, 5, 2,
                            help="More frames per SOP step = more accurate")
     show_logs = st.toggle("Show debug logs", value=True)
     st.divider()
@@ -283,6 +284,13 @@ SCORING CRITERIA (25 points):
 Give your assessment in 3-4 specific sentences describing exactly what you see."""
 }
 
+STEP_SCORE_LIMITS = {
+    "label": 30,
+    "unboxing": 20,
+    "tags": 25,
+    "product": 25,
+}
+
 # ── API call ──────────────────────────────────────────────────────────────────
 def query_vlm_multi(frames_b64, prompt, step_name):
     """Send multiple frames for one step — model sees all frames together."""
@@ -297,24 +305,28 @@ def query_vlm_multi(frames_b64, prompt, step_name):
                 "type": "image_url",
                 "image_url": {"url": f"data:image/jpeg;base64,{b64}"}
             })
-        content.append({"type": "text", "text": prompt})
+        max_score = STEP_SCORE_LIMITS[step_name]
+        content.append({"type": "text", "text": (
+            f"{prompt}\n\nUse only visible evidence. End with exactly `SCORE: n/{max_score}`, "
+            "where n is an integer from 0 to the maximum."
+        )})
 
         payload = {
             "model": HF_MODEL,
             "messages": [{"role": "user", "content": content}],
-            "max_tokens": 400,
+            "max_tokens": 250,
             "temperature": 0.1
         }
 
         log(f"Sending request ({len(frames_b64)} images)...")
-        response = requests.post(HF_API_URL, headers=HEADERS, json=payload, timeout=120)
+        response = requests.post(HF_API_URL, headers=HEADERS, json=payload, timeout=45)
         log(f"Response status: {response.status_code}")
 
         if response.status_code == 503:
             import time
-            log("Model loading — waiting 20s...", "WARN")
-            time.sleep(20)
-            response = requests.post(HF_API_URL, headers=HEADERS, json=payload, timeout=120)
+            log("Model loading — retrying once...", "WARN")
+            time.sleep(5)
+            response = requests.post(HF_API_URL, headers=HEADERS, json=payload, timeout=45)
             log(f"Retry status: {response.status_code}")
 
         if response.status_code == 200:
@@ -331,7 +343,7 @@ def query_vlm_multi(frames_b64, prompt, step_name):
             return f"API error {response.status_code}: {error}"
 
     except requests.exceptions.Timeout:
-        log("Timeout after 120s", "ERROR")
+        log("Timeout after 45s", "ERROR")
         return "Error: Request timed out"
     except Exception as e:
         log(f"Exception: {str(e)}", "ERROR")
@@ -340,6 +352,14 @@ def query_vlm_multi(frames_b64, prompt, step_name):
 # ── Scoring ───────────────────────────────────────────────────────────────────
 def score_response(text, weight):
     """Score based on positive/negative language in AI response."""
+    import re
+
+    explicit_score = re.search(r"score\s*:\s*(\d+)\s*/\s*(\d+)", text.lower())
+    if explicit_score:
+        reported_score = int(explicit_score.group(1))
+        reported_weight = max(1, int(explicit_score.group(2)))
+        return max(0, min(weight, round(reported_score * weight / reported_weight)))
+
     text_lower = text.lower()
     
     positive = ["visible", "can see", "shows", "displays", "readable", "present",
@@ -360,10 +380,10 @@ def score_response(text, weight):
     return int(weight * 0.20)
 
 # ── Main audit ────────────────────────────────────────────────────────────────
-def run_audit(video_bytes, stream_type, n_per_step, log_placeholder):
+def run_audit(video_bytes, stream_type, n_per_step, extension, log_placeholder):
     log(f"Starting audit — {stream_type} — {len(video_bytes)/1024/1024:.1f}MB")
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp:
+    with tempfile.NamedTemporaryFile(delete=False, suffix=extension) as tmp:
         tmp.write(video_bytes)
         tmp_path = tmp.name
     log(f"Saved to: {tmp_path}")
@@ -389,15 +409,20 @@ def run_audit(video_bytes, stream_type, n_per_step, log_placeholder):
             ("product",  "product_check"),
         ]
 
-        for step_key, result_key in step_map:
+        def analyze_step(step_key, result_key):
             log(f"--- Analyzing: {step_key} ---")
             frames = step_frames.get(step_key, [])
-            if frames:
-                text = query_vlm_multi(frames, STEP_PROMPTS[step_key], step_key)
-            else:
-                text = "No frames available for this step."
-            results[result_key] = text
-            show_log_box(log_placeholder)
+            if not frames:
+                return result_key, "No frames available for this step."
+            return result_key, query_vlm_multi(frames, STEP_PROMPTS[step_key], step_key)
+
+        with ThreadPoolExecutor(max_workers=len(step_map)) as executor:
+            futures = [executor.submit(analyze_step, step_key, result_key)
+                       for step_key, result_key in step_map]
+            for future in as_completed(futures):
+                result_key, text = future.result()
+                results[result_key] = text
+                show_log_box(log_placeholder)
 
         # Extract tracking number from label result
         import re
@@ -457,6 +482,10 @@ if not uploaded_files:
     st.info("Upload one or more inspection videos from the sidebar to begin.")
     st.stop()
 
+if not st.button("Analyze uploaded videos", type="primary", use_container_width=True):
+    st.info("Your videos are ready. Start the batch analysis when you are ready.")
+    st.stop()
+
 st.subheader(f"Batch Inspection — {len(uploaded_files)} video(s) · Stream: {video_type}")
 csv_rows = []
 
@@ -466,8 +495,9 @@ for file in uploaded_files:
 
     vid_col, result_col = st.columns([1, 1], gap="large")
 
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
-        video_bytes = file.read()
+    extension = os.path.splitext(file.name)[1].lower() or ".mp4"
+    video_bytes = file.getvalue()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=extension) as tmp:
         tmp.write(video_bytes)
         play_path = tmp.name
 
@@ -482,7 +512,7 @@ for file in uploaded_files:
         with st.spinner(f"Analyzing {file.name}..."):
             log(f"Processing: {file.name} ({len(video_bytes)/1024/1024:.1f} MB)")
             show_log_box(log_placeholder)
-            audit = run_audit(video_bytes, video_type, num_frames, log_placeholder)
+            audit = run_audit(video_bytes, video_type, num_frames, extension, log_placeholder)
 
         os.remove(play_path)
         show_log_box(log_placeholder)
